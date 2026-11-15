@@ -139,7 +139,10 @@ npm run typecheck && npm test
 pi -e .        # load the local package for one session
 ```
 
-CI runs the type check and the tests on Node 22.18 and 24 (`.github/workflows/ci.yml`).
+CI runs the type check and the tests on Node 22.19 and 24 (`.github/workflows/ci.yml`).
+Node 22.19 is the floor because the pi 1.5.2 host types declare `>=22.19.0`; below
+it npm silently resolves an older pi release and the type check fails on API
+that does not exist there.
 
 ## License
 
