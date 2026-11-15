@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0]
+
+Breaking, for the default directory only — set `worktreePath` explicitly to keep
+the old location.
+
+- The default worktree directory moved out of the checkout:
+  `{{ repo_path }}/.worktrees/{{ branch | sanitize }}` →
+  `{{ repo_parent }}/.wt/{{ repo }}-{{ branch | sanitize }}`. Worktrees are now
+  siblings of the repo, so `git status`, IDE indexing, repo-wide scans and any
+  "exclude .worktrees" rule are no longer involved, and cleaning up is one
+  `rm -rf .wt`. Existing worktrees keep working: records carry absolute paths, so
+  the reap pass still finds and reclaims them where they are.
+- New template variables `{{ repo_parent }}` / `{{ primary_worktree_parent }}`.
+- Templates are now always resolved and normalized, so `{{ repo_path }}/../.wt/…`
+  yields a clean absolute path instead of one containing `..`.
+- New `/wt-clean` command: runs the reap pass on demand and prints one line per
+  record (`would remove`, `kept`, `forget record`, `in use`). It is a dry run
+  until you pass `--apply`.
+
 ## [0.3.0]
 
 - Reap worktrees left behind by sessions that ended without a merge. Every

@@ -81,7 +81,11 @@ interface ProjectHook {
 
 const SECTION_NAME = "wt_worktree"
 const STATE_DIR_NAME = "pi-worktree"
-const DEFAULT_PATH_TEMPLATE = "{{ repo_path }}/.worktrees/{{ branch | sanitize }}"
+// WHY: the default keeps worktrees out of the primary checkout. A sibling `.wt`
+// directory leaves `git status`, IDE indexing and repo-wide scans untouched, and
+// makes cleanup a single `rm -rf`, instead of a special case the repo has to
+// exclude everywhere.
+const DEFAULT_PATH_TEMPLATE = "{{ repo_parent }}/.wt/{{ repo }}-{{ branch | sanitize }}"
 const DEFAULT_CREATE_TIMEOUT_MS = 900_000
 // Section names are validated against /^[a-z][a-z0-9_-]*$/ by the system-prompt builder.
 
@@ -357,14 +361,18 @@ async function resolvePathTemplate(
 
 /** Concrete worktree directory for `branch` from a path template. */
 export function worktreePathFor(template: string, projectRoot: string, cwd: string, branch: string): string {
+  const parent = dirname(projectRoot)
   const rendered = renderTemplate(template, {
     repo_path: projectRoot,
     primary_worktree_path: projectRoot,
+    repo_parent: parent,
+    primary_worktree_parent: parent,
     repo: projectRoot.split("/").pop() ?? "repo",
     branch,
     branch_sanitized: sanitize(branch),
   })
-  return isAbsolute(rendered) ? rendered : resolve(cwd, rendered)
+  // resolve() normalizes `..` in absolute templates and anchors relative ones.
+  return resolve(cwd, rendered)
 }
 
 function stateDir(commonDir: string): string {
@@ -519,6 +527,8 @@ async function removeWorktree(pi: ExtensionAPI, cwd: string, branch: string) {
 }
 
 export interface ReapReport {
+  /** What happened (or would happen, in a dry run) per record, oldest record first. */
+  entries: ReapEntry[]
   /** Branches whose worktree was removed. */
   removed: string[]
   /** Records deleted because their worktree directory no longer exists. */
@@ -531,6 +541,15 @@ export interface ReapReport {
   failed: string[]
 }
 
+/** One record and its verdict, for the dry-run listing. */
+export interface ReapEntry {
+  branch: string
+  path: string
+  action: ReapAction
+  work: PendingWork | null
+  note: string
+}
+
 /** True when a local branch of that name exists. */
 async function branchExists(pi: ExtensionAPI, cwd: string, branch: string): Promise<boolean> {
   return (await git(pi, cwd, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`])).code === 0
@@ -539,9 +558,16 @@ async function branchExists(pi: ExtensionAPI, cwd: string, branch: string): Prom
 /**
  * Reclaim what dead sessions left behind: forget records whose directory is gone,
  * remove abandoned worktrees that hold nothing, keep the ones that hold work.
+ * With `dryRun` nothing is touched and `entries` says what would happen.
  */
-export async function reapAbandoned(pi: ExtensionAPI, cwd: string, sessionId: string): Promise<ReapReport> {
-  const report: ReapReport = { removed: [], dropped: 0, orphanBranches: [], kept: [], failed: [] }
+export async function reapAbandoned(
+  pi: ExtensionAPI,
+  cwd: string,
+  sessionId: string,
+  opts: { dryRun?: boolean } = {},
+): Promise<ReapReport> {
+  const dry = opts.dryRun === true
+  const report: ReapReport = { entries: [], removed: [], dropped: 0, orphanBranches: [], kept: [], failed: [] }
   const common = await gitCommonDir(pi, cwd)
   if (!common) return report
   const own = `${sanitize(sessionId) || "session"}.json`
@@ -550,30 +576,70 @@ export async function reapAbandoned(pi: ExtensionAPI, cwd: string, sessionId: st
     if (file === own) continue
     const record = join(stateDir(common), file)
     if (!st || !worktreeExists(st)) {
-      try {
-        unlinkSync(record)
-      } catch {
-        // already gone
+      if (!dry) {
+        try {
+          unlinkSync(record)
+        } catch {
+          // already gone
+        }
       }
       report.dropped++
       pruned = true
       // The directory is gone, the branch usually is not. `-d` only deletes a
       // branch whose commits are already reachable; an unmerged one survives and
       // is reported instead, so a vanished checkout can never lose work.
-      if (st && (await git(pi, cwd, ["branch", "-d", st.branch])).code !== 0 && (await branchExists(pi, cwd, st.branch))) {
-        report.orphanBranches.push(st.branch)
-      }
+      const branchKept =
+        !dry && st
+          ? (await git(pi, cwd, ["branch", "-d", st.branch])).code !== 0 && (await branchExists(pi, cwd, st.branch))
+          : false
+      if (branchKept && st) report.orphanBranches.push(st.branch)
+      report.entries.push({
+        branch: st?.branch ?? file.replace(/\.json$/, ""),
+        path: st?.path ?? "?",
+        action: "drop-record",
+        work: null,
+        note: branchKept ? "directory gone, branch kept (unmerged)" : "directory gone",
+      })
       continue
     }
-    if (sessionAlive(st)) continue
+    if (sessionAlive(st)) {
+      report.entries.push({
+        branch: st.branch,
+        path: st.path,
+        action: "none",
+        work: null,
+        note: "session alive",
+      })
+      continue
+    }
     const work = await pendingWork(pi, st)
-    if (reapDecision({ exists: true, alive: false, work }) !== "remove-worktree") {
+    const action = reapDecision({ exists: true, alive: false, work })
+    if (action !== "remove-worktree") {
       report.kept.push(st.branch)
+      report.entries.push({
+        branch: st.branch,
+        path: st.path,
+        action: "keep",
+        work,
+        note: work ? describeWork(work) : "work could not be counted",
+      })
+      continue
+    }
+    if (dry) {
+      report.removed.push(st.branch)
+      report.entries.push({ branch: st.branch, path: st.path, action: "remove-worktree", work, note: "empty" })
       continue
     }
     const res = await removeWorktree(pi, cwd, st.branch)
     if (res.code !== 0) {
       report.failed.push(st.branch)
+      report.entries.push({
+        branch: st.branch,
+        path: st.path,
+        action: "remove-worktree",
+        work,
+        note: `wt remove failed: ${firstLine(res.stderr) || firstLine(res.stdout) || "unknown error"}`,
+      })
       continue
     }
     try {
@@ -582,9 +648,10 @@ export async function reapAbandoned(pi: ExtensionAPI, cwd: string, sessionId: st
       // already gone
     }
     report.removed.push(st.branch)
+    report.entries.push({ branch: st.branch, path: st.path, action: "remove-worktree", work, note: "empty" })
   }
   // A vanished directory leaves its admin entry behind in .git/worktrees.
-  if (pruned) await git(pi, cwd, ["worktree", "prune"])
+  if (pruned && !dry) await git(pi, cwd, ["worktree", "prune"])
   return report
 }
 
@@ -595,6 +662,17 @@ function describeReap(r: ReapReport): string | null {
   if (r.removed.length > 0) parts.push(`removed ${r.removed.length} unused worktree(s) (${r.removed.join(", ")})`)
   if (r.orphanBranches.length > 0) parts.push(`kept unmerged branch(es) ${r.orphanBranches.join(", ")}`)
   return parts.length > 0 ? parts.join("; ") : null
+}
+
+/** Per-record listing for `/wt-clean`, one line each. */
+export function describeReapEntries(r: ReapReport, dryRun: boolean): string[] {
+  const verb: Record<ReapAction, string> = {
+    none: "in use",
+    "drop-record": dryRun ? "forget record" : "forgot record",
+    "remove-worktree": dryRun ? "would remove" : "removed",
+    keep: "kept",
+  }
+  return r.entries.map((e) => `${verb[e.action]}  ${e.branch}  (${e.note})`)
 }
 
 /** Look up a just-created branch's worktree path via `wt list` (fallback when switch JSON is unreadable). */
@@ -1114,6 +1192,32 @@ export default async function (pi: ExtensionAPI) {
       }
       askedFor = workSignature(await pendingWork(pi, state))
       await askMerge(pi, ctx, session, state, setState, setMerging)
+    },
+  })
+
+  pi.registerCommand("wt-clean", {
+    description: "List worktrees left behind by dead sessions; add --apply to reclaim them",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const apply = /(^|\s)(--apply|--yes|-y)(\s|$)/.test(args)
+      if (merging) {
+        notify(ctx, "pi-worktree: merge in progress — nothing reclaimed", "warning")
+        return
+      }
+      const report = await reapAbandoned(pi, ctx.cwd, session.sessionId, { dryRun: !apply })
+      const lines = describeReapEntries(report, !apply).filter((l) => !l.startsWith("in use"))
+      if (state) lines.push(`in use  ${state.branch}  (this session, never touched)`)
+      if (lines.length === 0) {
+        notify(ctx, "pi-worktree: nothing to reclaim", "info")
+        return
+      }
+      notify(
+        ctx,
+        [
+          apply ? "pi-worktree: reclaimed" : "pi-worktree: dry run — pass --apply to act",
+          ...lines,
+        ].join("\n"),
+        "info",
+      )
     },
   })
 

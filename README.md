@@ -13,7 +13,7 @@ startup ──► reap: forget records whose worktree is gone, remove abandoned
             │  (project hooks from .config/wt.toml run here: copy-local, mise trust,
             │   go-cache, codegraph …)
             ▼
-        agent works inside <primary worktree>/.worktrees/<branch>
+        agent works inside <repo parent>/.wt/<repo>-<branch>
             ▼
 task settles ──► has work?  ── no ──► stay quiet, worktree kept
                     │ yes
@@ -30,7 +30,7 @@ The main checkout stays untouched, so a parallel session, an IDE build, or
 ## Install
 
 ```bash
-pi install git:github.com/x-thooh/pi-worktree@v0.3.0   # pinned
+pi install git:github.com/x-thooh/pi-worktree@v0.4.0   # pinned
 pi install git:github.com/x-thooh/pi-worktree         # track main
 ```
 
@@ -52,6 +52,7 @@ and updates over SSH with no proxy:
 | --- | --- |
 | `/wt-status` | Local branch, worktree path, base ref, merge target, pending work |
 | `/wt-merge` | Merge the worktree branch back into its target branch now |
+| `/wt-clean` | List leftover worktrees with a verdict each; `--apply` reclaims them |
 
 ## Reading the status
 
@@ -80,18 +81,22 @@ Resolution order — first match wins:
 | # | Source | Example |
 | --- | --- | --- |
 | 1 | env `PI_WT_WORKTREE_PATH` | `../wt/{{ branch \| sanitize }}` |
-| 2 | `<repo>/.pi/wt-worktree.json` → `worktreePath` | `"{{ repo_path }}/.worktrees/{{ branch \| sanitize }}"` |
+| 2 | `<repo>/.pi/wt-worktree.json` → `worktreePath` | `"{{ repo_parent }}/.wt/{{ repo }}-{{ branch \| sanitize }}"` |
 | 3 | `~/.pi/agent/wt-worktree.json` → `worktreePath` | same |
-| 4 | built-in default | `{{ repo_path }}/.worktrees/{{ branch \| sanitize }}` |
+| 4 | built-in default | `{{ repo_parent }}/.wt/{{ repo }}-{{ branch \| sanitize }}` |
 
 `<repo>` is the primary worktree — the directory that holds `.git` — so the
-default puts worktrees under `<project>/.worktrees/`, even when the session
-starts from a linked worktree. Relative templates resolve against the current
-directory. Template variables:
+default puts worktrees beside it, in a shared `.wt/` directory
+(`/src/marketing` → `/src/.wt/marketing-pi-20261115-130108-ysgo`), even when the
+session starts from a linked worktree. Keeping them out of the checkout means
+`git status`, IDE indexing and repo-wide scans never see them, and cleanup is one
+`rm -rf`. Relative templates resolve against the current directory. Template
+variables:
 
 | Variable | Value |
 | --- | --- |
 | `{{ repo_path }}` / `{{ primary_worktree_path }}` | absolute path of the primary worktree |
+| `{{ repo_parent }}` / `{{ primary_worktree_parent }}` | its parent directory |
 | `{{ repo }}` | its directory name |
 | `{{ branch }}` | full branch name, e.g. `pi/20261115-130108-ysgo` |
 | `{{ branch \| sanitize }}` | filesystem-safe form, e.g. `pi-20261115-130108-ysgo` |
@@ -101,7 +106,7 @@ Config files may be flat or wrapped in `wtWorktree`:
 
 ```json
 {
-  "worktreePath": "{{ repo_path }}/.worktrees/{{ branch | sanitize }}",
+  "worktreePath": "{{ repo_parent }}/.wt/{{ repo }}-{{ branch | sanitize }}",
   "hooks": true,
   "mergePrompt": true,
   "reap": true,
@@ -111,7 +116,7 @@ Config files may be flat or wrapped in `wtWorktree`:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `worktreePath` | `{{ repo_path }}/.worktrees/{{ branch \| sanitize }}` | directory template |
+| `worktreePath` | `{{ repo_parent }}/.wt/{{ repo }}-{{ branch \| sanitize }}` | directory template |
 | `hooks` | `true` | run `<repo>/.config/wt.toml` project hooks during creation |
 | `mergePrompt` | `true` | ask once when the agent settles |
 | `reap` | `true` | reclaim worktrees left behind by dead sessions |
@@ -137,6 +142,10 @@ A PID is only probed on the same host; a record from another machine is assumed
 live. A record untouched for seven days counts as dead even if its PID was
 recycled by an unrelated process. Quitting reclaims an empty worktree
 immediately, which is the common case; anything holding work is left for you.
+
+`/wt-clean` runs the same pass on demand and prints one line per record
+(`would remove`, `kept`, `forget record`, `in use`); it changes nothing until you
+pass `--apply`.
 
 Nothing in the reap path passes `--force` or `--force-delete`. `wt remove` and
 `git branch -d` both refuse a dirty or unmerged branch on their own, so a probe

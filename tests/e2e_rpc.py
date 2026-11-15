@@ -8,7 +8,7 @@ Not part of CI: it starts a real `pi` process and spends model tokens.
 
 Drives a real Pi run in a scratch git repo and asserts the three behaviours that
 the unit tests cannot reach:
-  1. a worktree is created on startup, in <repo>/.worktrees/<branch>,
+  1. a worktree is created on startup, in <repo parent>/.wt/<repo>-<branch>,
   2. the project's .config/wt.toml pre-start hook runs,
   3. an empty task never raises the merge dialog, while a task that writes
      something does — and answering "no" keeps the worktree, answering "yes"
@@ -203,7 +203,7 @@ def main():
                 failures.append(f"A: status does not mark the local merge target: {last}")
 
         branches = sh("git", "branch", "--list", "pi/*").stdout.split()
-        worktrees = [l for l in sh("git", "worktree", "list").stdout.splitlines() if ".worktrees" in l]
+        worktrees = [l for l in sh("git", "worktree", "list").stdout.splitlines() if "/.wt/" in l]
         print("branches:", branches)
         print("worktrees:", worktrees)
         if not worktrees:

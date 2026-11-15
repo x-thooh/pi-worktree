@@ -9,6 +9,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import {
   buildSection,
   defaultPidProbe,
+  describeReapEntries,
   hasWork,
   isBaseline,
   parseStatus,
@@ -50,6 +51,17 @@ test("renderTemplate expands variables and the sanitize filter", () => {
   assert.equal(renderTemplate("{{ repo_path }}/.worktrees/{{ branch | sanitize }}", vars), "/repo/.worktrees/pi-1")
   assert.equal(renderTemplate("{{branch}}", vars), "pi/1")
   assert.equal(renderTemplate("{{ missing }}", vars), "")
+})
+
+test("worktreePathFor can place worktrees beside the repo and normalizes ..", () => {
+  assert.equal(
+    worktreePathFor("{{ repo_parent }}/.wt/{{ repo }}-{{ branch | sanitize }}", "/src/repo", "/src/repo", "pi/1"),
+    "/src/.wt/repo-pi-1",
+  )
+  assert.equal(
+    worktreePathFor("{{ repo_path }}/../.wt/{{ branch | sanitize }}", "/src/repo", "/src/repo/sub", "pi/1"),
+    "/src/.wt/pi-1",
+  )
 })
 
 test("worktreePathFor resolves relative templates against the cwd", () => {
@@ -263,4 +275,28 @@ test("sessionAlive treats a pid-less record and a stale one as gone", () => {
 
 test("the default pid probe sees this process", () => {
   assert.equal(defaultPidProbe(process.pid), true)
+})
+
+test("describeReapEntries words a dry run differently from an applied pass", () => {
+  const report = {
+    entries: [
+      { branch: "pi/a", path: "/x/a", action: "remove-worktree" as const, work: { commits: 0, files: 0 }, note: "empty" },
+      { branch: "pi/b", path: "/x/b", action: "keep" as const, work: { commits: 2, files: 0 }, note: "2 commits" },
+      { branch: "pi/c", path: "/x/c", action: "drop-record" as const, work: null, note: "directory gone" },
+      { branch: "pi/d", path: "/x/d", action: "none" as const, work: null, note: "session alive" },
+    ],
+    removed: ["pi/a"],
+    dropped: 1,
+    orphanBranches: [],
+    kept: ["pi/b"],
+    failed: [],
+  }
+  assert.deepEqual(describeReapEntries(report, true), [
+    "would remove  pi/a  (empty)",
+    "kept  pi/b  (2 commits)",
+    "forget record  pi/c  (directory gone)",
+    "in use  pi/d  (session alive)",
+  ])
+  assert.equal(describeReapEntries(report, false)[0], "removed  pi/a  (empty)")
+  assert.equal(describeReapEntries(report, false)[2], "forgot record  pi/c  (directory gone)")
 })
