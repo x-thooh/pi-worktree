@@ -134,8 +134,8 @@ everything; `/wt-merge` asks again later.
 ## Development
 
 ```bash
-bun install
-bun run typecheck && bun run test
+npm install
+npm run typecheck && npm test
 pi -e .        # load the local package for one session
 ```
 
