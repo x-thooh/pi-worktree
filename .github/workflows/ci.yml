@@ -24,6 +24,11 @@ jobs:
       # host-provided types and typescript for the type check.
       - run: npm install --no-audit --no-fund
 
+      # Print the resolved host package: the extension is written against the
+      # types of the pi release it ships with, so a resolver surprise here is
+      # the first thing to check when the type check fails only in CI.
+      - run: npm ls @earendil-works/pi-coding-agent
+
       - run: npx tsc --noEmit
 
       - run: node --experimental-strip-types --test tests/extension.test.ts
