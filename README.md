@@ -43,8 +43,28 @@ and updates over SSH with no proxy:
 
 | Command | Effect |
 | --- | --- |
-| `/wt-status` | Branch, path, base → target, and how much work is pending |
+| `/wt-status` | Local branch, worktree path, base ref, merge target, pending work |
 | `/wt-merge` | Merge the worktree branch back into its target branch now |
+
+## Reading the status
+
+Every ref is labelled with its role, because three different branches are in play:
+
+```
+wt · local pi/20261115-130108-ysgo ← remote origin/master → local master 2 commits, 1 uncommitted file
+```
+
+| Label | Meaning |
+| --- | --- |
+| `local <branch>` | the throwaway branch created for this session; it has no upstream and is deleted after the merge |
+| `← remote <ref>` | the remote-tracking base the branch was cut from, used only as a diff base |
+| `→ local <target>` | the local branch `wt merge` fast-forwards |
+
+The role comes from git (`git rev-parse --verify refs/remotes/<ref>`), not from the
+shape of the name, so a local branch like `feature/lr/4.3.8.2` is still reported as
+local. `/wt-status` prints one field per line; the same wording appears in the
+creation notice, the merge dialog, and the system-prompt section that keeps the
+agent inside the worktree.
 
 ## Worktree directory
 
@@ -117,7 +137,14 @@ Only when the worktree actually carries work:
 An empty worktree stays put, silently, with a one-line notification — no
 dialog. The prompt runs `wt merge --branch <branch> <target>`: squash, rebase,
 fast-forward the target, remove the worktree (and its branch). Declining keeps
-everything; `/wt-merge` asks again later.
+everything; `/wt-merge` asks again on demand.
+
+Untracked files that the project hooks produced before the agent started are
+not counted as work, and the question returns as soon as the pending work grows.
+
+Note that `wt merge` stages everything by default, hook output included, so
+gitignore the files your hooks create (`.go`, `.codegraph`, local config) — that
+is what the marketing repo's `.gitignore` does.
 
 ## Behaviour details
 
@@ -137,7 +164,13 @@ everything; `/wt-merge` asks again later.
 npm install
 npm run typecheck && npm test
 pi -e .        # load the local package for one session
+python3 tests/e2e_rpc.py                 # drive a real Pi over RPC (spends tokens)
+PI_WT_E2E_INSTALLED=1 python3 tests/e2e_rpc.py   # same, against the installed package
 ```
+
+`tests/e2e_rpc.py` covers what the unit tests cannot: worktree creation with the
+project hook, the footer status, the dialog appearing only when work exists, and
+`/wt-merge` merging back and removing the worktree.
 
 CI runs the type check and the tests on Node 22.19 and 24 (`.github/workflows/ci.yml`).
 Node 22.19 is the floor because the pi 1.5.2 host types declare `>=22.19.0`; below

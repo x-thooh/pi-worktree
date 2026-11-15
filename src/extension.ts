@@ -41,6 +41,14 @@ export interface WorktreeState {
   base: string // base ref used at creation, e.g. "origin/main"
   target: string // local merge target, e.g. "main"
   pathSource: string // where the directory template came from (diagnostics)
+  /** True when the base is a remote-tracking ref (origin/main), false for a local branch. */
+  baseIsRemote?: boolean
+  /**
+   * Untracked paths that already existed once the worktree was set up — project
+   * hook output (copied local config, warm caches, marker files). They are not
+   * the agent's work, so they must not trigger the merge prompt.
+   */
+  baseline?: string[]
   createdAt: number
 }
 
@@ -227,23 +235,65 @@ async function defaultBranch(pi: ExtensionAPI, cwd: string, remote: string): Pro
  * upstream, else the remote default branch, else the current branch.
  * Returns null when nothing usable exists (e.g. detached HEAD with no remote).
  */
-async function resolveBase(pi: ExtensionAPI, cwd: string): Promise<{ base: string; target: string } | null> {
+async function resolveBase(
+  pi: ExtensionAPI,
+  cwd: string,
+): Promise<{ base: string; target: string; baseIsRemote: boolean } | null> {
   const up = await git(pi, cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
   if (up.code === 0 && up.stdout.trim()) {
     const base = up.stdout.trim()
-    return { base, target: shortOf(base) }
+    // @{u} is a remote-tracking ref by definition (origin/main, upstream/main).
+    return { base, target: shortOf(base), baseIsRemote: true }
   }
 
   const remote = await firstRemote(pi, cwd)
   if (remote) {
     const def = await defaultBranch(pi, cwd, remote)
-    return { base: `${remote}/${def}`, target: def }
+    return { base: `${remote}/${def}`, target: def, baseIsRemote: true }
   }
 
+  // No remote at all: base and target are the same local branch.
   const head = await git(pi, cwd, ["rev-parse", "--abbrev-ref", "HEAD"])
   const cur = head.stdout.trim()
-  if (cur && cur !== "HEAD") return { base: cur, target: cur }
+  if (cur && cur !== "HEAD") return { base: cur, target: cur, baseIsRemote: false }
   return null
+}
+
+/**
+ * "remote origin/master" or "local feature/x": branch names may contain a slash,
+ * so the role is decided by git, not by the shape of the name.
+ */
+export async function refLabel(pi: ExtensionAPI, cwd: string, ref: string, isRemote?: boolean): Promise<string> {
+  if (isRemote === true) return `remote ${ref}`
+  if (isRemote === false) return `local ${ref}`
+  const remote = await git(pi, cwd, ["rev-parse", "--verify", "--quiet", `refs/remotes/${ref}`])
+  return remote.code === 0 ? `remote ${ref}` : `local ${ref}`
+}
+
+const STATUS_KEY = "wt-worktree"
+
+/** Footer status: local worktree branch, the base it came from, and the local merge target. */
+export async function statusLine(pi: ExtensionAPI, st: WorktreeState, work?: PendingWork | null): Promise<string> {
+  const base = await refLabel(pi, st.path, st.base, st.baseIsRemote)
+  const parts = [`wt · local ${st.branch}`, `← ${base}`, `→ local ${st.target}`]
+  if (work) parts.push(describeWork(work))
+  return parts.join(" ")
+}
+
+/** Publish the status line, or clear it when there is no worktree. */
+async function updateStatus(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  st: WorktreeState | null,
+  work?: PendingWork | null,
+): Promise<void> {
+  if (!ctx.hasUI) return
+  try {
+    if (!st) ctx.ui.setStatus(STATUS_KEY, undefined)
+    else ctx.ui.setStatus(STATUS_KEY, await statusLine(pi, st, work))
+  } catch {
+    // status is cosmetic; never fail the session over it
+  }
 }
 
 /** Unique, readable branch name: pi/<YYYYMMDD-HHMMSS>-<rand4>. */
@@ -279,7 +329,6 @@ function describeHooks(hooks: ProjectHook[]): string {
  * Returns the template plus a label describing where it came from.
  */
 async function resolvePathTemplate(
-  pi: ExtensionAPI,
   projectRoot: string,
   config: WtWorktreeConfig,
 ): Promise<{ template: string; source: string }> {
@@ -394,30 +443,93 @@ export interface PendingWork {
   files: number
 }
 
+/**
+ * One `git status --porcelain -z` entry. With -z the format is `XY <path>\0`, and
+ * a rename or copy is followed by the source path as its own record.
+ */
+interface StatusEntry {
+  code: string
+  file: string
+}
+
+/** Parse `git status --porcelain -z` output into entries. */
+export function parseStatus(raw: string): StatusEntry[] {
+  const out: StatusEntry[] = []
+  const parts = raw.split("\0")
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i] ?? ""
+    if (entry.length < 4) continue // "XY path"
+    const code = entry.slice(0, 2)
+    const file = entry.slice(3)
+    if (code.includes("R") || code.includes("C")) i++ // the source path follows
+    out.push({ code, file })
+  }
+  return out
+}
+
+/**
+ * Untracked paths in the worktree, as `git status --porcelain -z` reports them.
+ * Used to remember what the project hooks put there before the agent started.
+ */
+export async function untrackedPaths(pi: ExtensionAPI, path: string): Promise<string[]> {
+  const res = await git(pi, path, ["status", "--porcelain", "-z", "--untracked-files=all"])
+  if (res.code !== 0) return []
+  return parseStatus(res.stdout)
+    .filter((e) => e.code === "??")
+    .map((e) => e.file)
+}
+
+/** True when `file` was already untracked before the agent started working. */
+export function isBaseline(st: WorktreeState, file: string): boolean {
+  return (st.baseline ?? []).some((b) => b === file || file.startsWith(b.endsWith("/") ? b : `${b}/`))
+}
+
+/** Commits on HEAD that the base ref does not have. */
+async function countCommits(pi: ExtensionAPI, st: WorktreeState): Promise<number> {
+  const ahead = await git(pi, st.path, ["rev-list", "--count", `${st.base}..HEAD`])
+  if (ahead.code === 0) return Number.parseInt(ahead.stdout.trim(), 10) || 0
+
+  // base may be gone (deleted remote branch); fall back to the merge base.
+  const mb = await git(pi, st.path, ["merge-base", "HEAD", st.target])
+  if (mb.code !== 0 || !mb.stdout.trim()) return 0
+  const c = await git(pi, st.path, ["rev-list", "--count", `${mb.stdout.trim()}..HEAD`])
+  return c.code === 0 ? Number.parseInt(c.stdout.trim(), 10) || 0 : 0
+}
+
+/**
+ * Changed files, ignoring untracked ones that the project hooks produced.
+ * Hook output (copied local config, warm caches, marker files) is untracked in
+ * projects that do not gitignore it, and it is not the agent's work.
+ */
+async function countFiles(pi: ExtensionAPI, st: WorktreeState): Promise<number> {
+  const status = await git(pi, st.path, ["status", "--porcelain", "-z", "--untracked-files=all"])
+  if (status.code !== 0) return 0
+  return parseStatus(status.stdout).filter((e) => !(e.code === "??" && isBaseline(st, e.file))).length
+}
+
 /** Count what a merge would carry; null when the counts cannot be determined. */
 export async function pendingWork(pi: ExtensionAPI, st: WorktreeState): Promise<PendingWork | null> {
   if (!worktreeExists(st)) return null
-
-  let commits = 0
-  const ahead = await git(pi, st.path, ["rev-list", "--count", `${st.base}..HEAD`])
-  if (ahead.code === 0) commits = Number.parseInt(ahead.stdout.trim(), 10) || 0
-  else {
-    // base may be gone (deleted remote branch); fall back to the merge base.
-    const mb = await git(pi, st.path, ["merge-base", "HEAD", st.target])
-    if (mb.code === 0 && mb.stdout.trim()) {
-      const c = await git(pi, st.path, ["rev-list", "--count", `${mb.stdout.trim()}..HEAD`])
-      if (c.code === 0) commits = Number.parseInt(c.stdout.trim(), 10) || 0
-    }
-  }
-
-  const status = await git(pi, st.path, ["status", "--porcelain"])
-  const files = status.code === 0 ? status.stdout.split("\n").filter((l) => l.trim()).length : 0
-
+  const [commits, files] = await Promise.all([countCommits(pi, st), countFiles(pi, st)])
   return { commits, files }
 }
 
 export function hasWork(w: PendingWork | null): boolean {
   return !!w && (w.commits > 0 || w.files > 0)
+}
+
+/** Identity of a pending-work snapshot, so the same amount is not offered twice. */
+export function workSignature(w: PendingWork | null): string {
+  return w ? `${w.commits}:${w.files}` : "unknown"
+}
+
+/**
+ * Whether to ask about merging now. Nothing pending never asks, and an amount the
+ * user already declined is not offered again — but a session holds several turns,
+ * so once the pending work grows the question comes back.
+ */
+export function shouldOfferMerge(work: PendingWork | null, askedFor: string | null): boolean {
+  return hasWork(work) && workSignature(work) !== askedFor
 }
 
 /** Human summary of pending work, e.g. "2 commits, 3 uncommitted files". */
@@ -508,16 +620,18 @@ async function setup(
   }
 
   const branch = makeBranchName()
-  const { template, source } = await resolvePathTemplate(pi, projectRoot, config)
+  const { template, source } = await resolvePathTemplate(projectRoot, config)
   const path = worktreePathFor(template, projectRoot, cwd, branch)
 
   // Project hooks are part of creation: without them the new worktree has no
   // local config and no warm Go/module caches, so the agent starts cold.
   const hooks = config.hooks ? await projectHooks(pi, projectRoot) : []
   const hookNote = describeHooks(hooks)
+  const baseLabel = await refLabel(pi, cwd, base.base, base.baseIsRemote)
   notify(
     ctx,
-    `pi-worktree: creating "${branch}" (base ${base.base}) at ${path}${hookNote ? ` — running ${hookNote}` : ""}`,
+    `pi-worktree: creating local branch "${branch}" from ${baseLabel}, merge target local "${base.target}" — at ${path}` +
+      (hookNote ? ` — running ${hookNote}` : ""),
     "info",
   )
 
@@ -560,20 +674,26 @@ async function setup(
     path: createdPath,
     base: base.base,
     target: base.target,
+    baseIsRemote: base.baseIsRemote,
     pathSource: source,
+    baseline: await untrackedPaths(pi, createdPath),
     createdAt: Date.now(),
   }
   setState(st)
   await writeState(pi, cwd, session.sessionId, st)
-  notify(ctx, `pi-worktree: ready — ${branch} @ ${createdPath} (base ${base.base}, path from ${source})`, "info")
+  notify(ctx, `pi-worktree: ready — local ${branch} @ ${createdPath} (path from ${source})`, "info")
+  await updateStatus(ctx, pi, st)
 }
 
 /** System-prompt section text that directs the agent into the worktree. */
-function buildSection(st: WorktreeState): string {
+export function buildSection(st: WorktreeState): string {
+  const baseRole = st.baseIsRemote === false ? "local branch" : "remote-tracking branch"
   return [
     "The pi-worktree extension created an isolated git worktree for this session. Make ALL changes inside it:",
     `- Worktree: ${st.path}`,
-    `- Branch: ${st.branch} (branched from ${st.base})`,
+    `- Local branch: ${st.branch} (created for this session, no upstream — do not push it)`,
+    `- Base: ${st.base}, a ${baseRole}; it is only the diff base, commit onto the local branch`,
+    `- Merge target: ${st.target}, a local branch; the extension fast-forwards it when merging`,
     `Use absolute paths under the worktree for read/write/edit tools, and run shell commands with 'cd ${st.path} && ...'.`,
     `Do NOT run git merge, rebase, or wt merge yourself. When the task is done, the extension asks whether to merge "${st.branch}" into "${st.target}".`,
   ].join("\n")
@@ -589,9 +709,10 @@ async function doMerge(
   setMerging: (v: boolean) => void,
 ): Promise<void> {
   if (!worktreeExists(st)) {
-    notify(ctx, `pi-worktree: worktree "${st.branch}" is already gone — clearing state`, "warning")
+    notify(ctx, `pi-worktree: worktree for local "${st.branch}" is already gone — clearing state`, "warning")
     setState(null)
     await removeState(pi, ctx.cwd, session.sessionId)
+    await updateStatus(ctx, pi, null)
     return
   }
 
@@ -612,6 +733,7 @@ async function doMerge(
       )
       setState(null)
       await removeState(pi, ctx.cwd, session.sessionId)
+      await updateStatus(ctx, pi, null)
     } else {
       notify(
         ctx,
@@ -626,7 +748,7 @@ async function doMerge(
   }
 }
 
-/** Ask the user whether to merge, then merge if confirmed. */
+/** Ask the user whether to merge, then merge if confirmed. Returns what was offered. */
 async function askMerge(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -634,20 +756,23 @@ async function askMerge(
   st: WorktreeState,
   setState: (st: WorktreeState | null) => void,
   setMerging: (v: boolean) => void,
-): Promise<void> {
-  if (!ctx.hasUI) return // cannot prompt in print/json mode; leave the worktree for the user
+): Promise<PendingWork | null> {
+  if (!ctx.hasUI) return null // cannot prompt in print/json mode; leave the worktree for the user
 
   const work = await pendingWork(pi, st)
   const detail = work ? describeWork(work) : "unknown changes"
+  const baseLabel = await refLabel(pi, st.path, st.base, st.baseIsRemote)
   const ok = await ctx.ui.confirm(
     "wt merge?",
-    `Merge "${st.branch}" into ${st.target}? (${detail}) This squashes + rebases + fast-forwards the branch, then removes the worktree.`,
+    `Merge local branch "${st.branch}" into local branch "${st.target}"? (${detail}; base ${baseLabel}) ` +
+      "This squashes + rebases + fast-forwards the local target, then removes the worktree.",
   )
   if (ok) {
     await doMerge(pi, ctx, session, st, setState, setMerging)
   } else {
-    notify(ctx, `pi-worktree: kept worktree "${st.branch}". Run /wt-merge later to merge.`, "info")
+    notify(ctx, `pi-worktree: kept local "${st.branch}". Run /wt-merge later to merge.`, "info")
   }
+  return work
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -664,13 +789,18 @@ export default async function (pi: ExtensionAPI) {
   }
 
   let state: WorktreeState | null = null
-  let mergePrompted = false // ask at most once per worktree; /wt-merge stays available
+  // What the user was already offered and declined, as "commits:files". A session
+  // usually holds several turns: asking once and then going silent would bury the
+  // worktree forever, so a change in the pending work asks again.
+  let askedFor: string | null = null
+  let emptyNotified = false // announce "nothing to merge" once per idle streak
   let merging = false // re-entrancy guard
   const session: SessionRef = { sessionId: "default" }
 
   const setState = (st: WorktreeState | null) => {
     state = st
-    if (st) mergePrompted = false
+    askedFor = null
+    emptyNotified = false
   }
   const setMerging = (v: boolean) => {
     merging = v
@@ -690,22 +820,34 @@ export default async function (pi: ExtensionAPI) {
       // reload/new/resume/fork: re-attach to the persisted worktree so the merge
       // prompt (and /wt-merge) keep working after a /reload rebuilds this module.
       const st = await readState(pi, ctx.cwd, session.sessionId)
-      state = st && worktreeExists(st) ? st : null
-      mergePrompted = false
+      setState(st && worktreeExists(st) ? st : null)
+      await updateStatus(ctx, pi, state)
     } catch (err) {
       console.error("[pi-worktree] session_start error:", err)
     }
   })
 
-  pi.on("before_agent_start", (event: BeforeAgentStartEvent) => {
+  pi.on("before_agent_start", async (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
     if (!state) return
     event.systemPromptOptions.sections[SECTION_NAME] = buildSection(state)
+    // post-start hooks are spawned in the background by wt, so they may land
+    // after the snapshot taken at creation. Widen the baseline before the agent
+    // touches anything; files it creates from here on still count as work.
+    try {
+      const known = new Set(state.baseline ?? [])
+      for (const file of await untrackedPaths(pi, state.path)) known.add(file)
+      state.baseline = [...known]
+      await writeState(pi, ctx.cwd, session.sessionId, state)
+    } catch (err) {
+      console.error("[pi-worktree] baseline refresh error:", err)
+    }
+    await updateStatus(ctx, pi, state, await pendingWork(pi, state))
   })
 
   pi.on("agent_settled", async (event: AgentSettledEvent, ctx: ExtensionContext) => {
     try {
       if (event.aborted) return // an aborted run is not "task complete"
-      if (!state || mergePrompted || merging) return
+      if (!state || merging) return
       if (!worktreeExists(state)) {
         setState(null)
         await removeState(pi, ctx.cwd, session.sessionId)
@@ -714,13 +856,18 @@ export default async function (pi: ExtensionAPI) {
 
       // Nothing was produced: a merge would be a no-op, so do not interrupt.
       const work = await pendingWork(pi, state)
+      await updateStatus(ctx, pi, state, work)
       if (!hasWork(work)) {
-        mergePrompted = true
-        notify(ctx, `pi-worktree: no changes in "${state.branch}" — nothing to merge`, "info")
+        if (!emptyNotified) {
+          emptyNotified = true
+          notify(ctx, `pi-worktree: no changes on local "${state.branch}" — nothing to merge`, "info")
+        }
         return
       }
+      emptyNotified = false
       if (!ctx.hasUI) return
-      mergePrompted = true
+      if (!shouldOfferMerge(work, askedFor)) return // already offered exactly this much
+      askedFor = workSignature(work)
       await askMerge(pi, ctx, session, state, setState, setMerging)
     } catch (err) {
       console.error("[pi-worktree] agent_settled error:", err)
@@ -738,7 +885,7 @@ export default async function (pi: ExtensionAPI) {
         notify(ctx, "pi-worktree: no active worktree", "warning")
         return
       }
-      mergePrompted = true
+      askedFor = workSignature(await pendingWork(pi, state))
       await askMerge(pi, ctx, session, state, setState, setMerging)
     },
   })
@@ -751,9 +898,17 @@ export default async function (pi: ExtensionAPI) {
         return
       }
       const work = await pendingWork(pi, state)
+      const baseLabel = await refLabel(pi, state.path, state.base, state.baseIsRemote)
       notify(
         ctx,
-        `pi-worktree: branch ${state.branch} @ ${state.path} (base ${state.base} → ${state.target}, path from ${state.pathSource}, ${work ? describeWork(work) : "unknown changes"})`,
+        [
+          `local branch : ${state.branch}`,
+          `worktree     : ${state.path}`,
+          `base ref     : ${baseLabel} (diff base only)`,
+          `merge target : local ${state.target}`,
+          `pending      : ${work ? describeWork(work) : "unknown changes"}`,
+          `path source  : ${state.pathSource}`,
+        ].join("\n"),
         "info",
       )
     },

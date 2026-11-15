@@ -6,7 +6,20 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
-import { hasWork, pendingWork, renderTemplate, sanitize, worktreePathFor } from "../src/extension.ts"
+import {
+  buildSection,
+  hasWork,
+  isBaseline,
+  parseStatus,
+  pendingWork,
+  refLabel,
+  renderTemplate,
+  sanitize,
+  shouldOfferMerge,
+  statusLine,
+  workSignature,
+  worktreePathFor,
+} from "../src/extension.ts"
 import type { WorktreeState } from "../src/extension.ts"
 
 /** Minimal ExtensionAPI stub: only `exec` is used by the code under test. */
@@ -68,6 +81,123 @@ test("pendingWork counts commits ahead of base and uncommitted files", async () 
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("parseStatus keeps renames from eating the next entry", () => {
+  // -z framing: "XY path\0", a rename adds its source path as its own record
+  const raw = "?? hook.txt\0 M a.txt\0R  new.txt\0old.txt\0"
+  assert.deepEqual(parseStatus(raw), [
+    { code: "??", file: "hook.txt" },
+    { code: " M", file: "a.txt" },
+    { code: "R ", file: "new.txt" },
+  ])
+})
+
+test("isBaseline covers a file and everything below a directory entry", () => {
+  const st = worktreeState("/x")
+  st.baseline = [".go", "mise.local.toml"]
+  assert.equal(isBaseline(st, ".go"), true)
+  assert.equal(isBaseline(st, ".go/pkg/mod/x"), true)
+  assert.equal(isBaseline(st, ".gomod"), false)
+  assert.equal(isBaseline(st, "mise.local.toml"), true)
+  assert.equal(isBaseline(worktreeState("/x"), "anything"), false)
+})
+
+test("hook output present at creation does not count as work", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worktree-baseline-"))
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: "pipe" })
+  try {
+    git("init", "-q", "-b", "main", ".")
+    writeFileSync(join(dir, "a.txt"), "one\n")
+    git("add", "-A")
+    git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "init")
+
+    // what a pre-start hook leaves behind in a project that does not gitignore it
+    writeFileSync(join(dir, "pre-start.txt"), "marker\n")
+    const st = worktreeState(dir)
+    st.baseline = ["pre-start.txt"]
+    assert.deepEqual(await pendingWork(fakePi, st), { commits: 0, files: 0 })
+    assert.equal(hasWork(await pendingWork(fakePi, st)), false)
+
+    // the agent's own new file still counts
+    writeFileSync(join(dir, "hello.txt"), "hi\n")
+    assert.deepEqual(await pendingWork(fakePi, st), { commits: 0, files: 1 })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("refLabel names the role from git, not from the shape of the name", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worktree-refs-"))
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: "pipe" })
+  try {
+    git("init", "-q", "-b", "main", ".")
+    writeFileSync(join(dir, "a.txt"), "one\n")
+    git("add", "-A")
+    git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "init")
+    git("branch", "feature/lr/4.3.8.2")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+    // a local branch with slashes must not be mistaken for a remote-tracking ref
+    assert.equal(await refLabel(fakePi, dir, "feature/lr/4.3.8.2"), "local feature/lr/4.3.8.2")
+    assert.equal(await refLabel(fakePi, dir, "origin/main"), "remote origin/main")
+    assert.equal(await refLabel(fakePi, dir, "origin/main", false), "local origin/main")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("statusLine separates the local branch, its base and the local target", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-worktree-status-"))
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: "pipe" })
+  try {
+    git("init", "-q", "-b", "main", ".")
+    writeFileSync(join(dir, "a.txt"), "one\n")
+    git("add", "-A")
+    git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "init")
+
+    const st = worktreeState(dir)
+    st.branch = "pi/20261115-130108-ysgo"
+    st.base = "origin/main"
+    st.baseIsRemote = true
+    const line = await statusLine(fakePi, st)
+    assert.match(line, /local pi\/20261115-130108-ysgo/)
+    assert.match(line, /remote origin\/main/)
+    assert.match(line, /local main/)
+
+    const withWork = await statusLine(fakePi, st, { commits: 2, files: 1 })
+    assert.match(withWork, /2 commits, 1 uncommitted file/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("buildSection states the role of the branch, the base and the target", () => {
+  const st = worktreeState("/x")
+  st.branch = "pi/1"
+  st.base = "origin/main"
+  st.baseIsRemote = true
+  const section = buildSection(st)
+  assert.match(section, /Local branch: pi\/1/)
+  assert.match(section, /Base: origin\/main, a remote-tracking branch/)
+  assert.match(section, /Merge target: main, a local branch/)
+
+  st.baseIsRemote = false
+  st.base = "feature/lr/4.3.8.2"
+  st.target = "feature/lr/4.3.8.2"
+  assert.match(buildSection(st), /Base: feature\/lr\/4\.3\.8\.2, a local branch/)
+})
+
+test("the merge question returns when the pending work grows", () => {
+  const empty = { commits: 0, files: 0 }
+  const oneFile = { commits: 0, files: 1 }
+  const twoFiles = { commits: 0, files: 2 }
+
+  assert.equal(shouldOfferMerge(empty, null), false) // nothing to merge, stay quiet
+  assert.equal(shouldOfferMerge(oneFile, null), true) // first offer
+  assert.equal(shouldOfferMerge(oneFile, workSignature(oneFile)), false) // declined, same amount
+  assert.equal(shouldOfferMerge(twoFiles, workSignature(oneFile)), true) // grew, ask again
+  assert.equal(shouldOfferMerge(null, null), false)
 })
 
 test("pendingWork reports nothing for a missing worktree", async () => {

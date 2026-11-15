@@ -1,6 +1,6 @@
 {
   "name": "@xthooh/pi-worktree",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension: work in an isolated git worktree created by wt (worktrunk), merge back when the task is done.",
   "keywords": [
     "pi-package",
