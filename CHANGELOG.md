@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.0]
+
+- Reap worktrees left behind by sessions that ended without a merge. Every
+  startup now walks the records under `<git-common-dir>/pi-worktree/` and:
+  forgets records whose directory is gone (plus `git worktree prune`), removes
+  abandoned worktrees that hold no commits and no uncommitted files, and keeps —
+  with a warning naming the branches — anything that holds work.
+- Records now carry the owning PID, host, and last-touched time, so a live
+  session is never disturbed: a PID is probed with signal 0 on the same host, a
+  record from another machine is assumed live, and a record untouched for seven
+  days counts as dead even if its PID was recycled.
+- Quitting the session reclaims an empty worktree immediately instead of leaving
+  it for the next startup. `reload`/`new`/`resume`/`fork` still hand the worktree
+  over untouched.
+- Records written before this version have no PID, so the first startup after
+  upgrading clears the leftovers they describe — the exact case this fixes.
+- New `reap` setting (default `true`, env `PI_WT_WORKTREE_REAP`) to turn the
+  automatic cleanup off.
+- Safety: no reap path passes `--force` or `--force-delete`. `wt remove` and
+  `git branch -d` refuse a dirty worktree or an unmerged branch by themselves, so
+  a wrong liveness probe can only fail to clean up, never discard work.
+
 ## [0.2.0]
 
 - Label every ref with its role: `local <branch>` for the session branch,

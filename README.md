@@ -5,7 +5,11 @@ git worktree created by [wt (worktrunk)](https://worktrunk.dev), and merges it
 back when the task is done.
 
 ```
-startup ──► wt switch --create pi/<stamp> --base <upstream> --path <template>
+startup ──► reap: forget records whose worktree is gone, remove abandoned
+            worktrees that hold nothing, keep the ones that hold work
+            │
+            ▼
+        wt switch --create pi/<stamp> --base <upstream> --path <template>
             │  (project hooks from .config/wt.toml run here: copy-local, mise trust,
             │   go-cache, codegraph …)
             ▼
@@ -15,6 +19,9 @@ task settles ──► has work?  ── no ──► stay quiet, worktree kept
                     │ yes
                     ▼
                  wt merge <branch> <target>   (squash + rebase + fast-forward + remove)
+
+quit ───────► has work?  ── no ──► wt remove, record forgotten
+                    │ yes ──► record kept, next startup reports it as abandoned
 ```
 
 The main checkout stays untouched, so a parallel session, an IDE build, or
@@ -23,7 +30,7 @@ The main checkout stays untouched, so a parallel session, an IDE build, or
 ## Install
 
 ```bash
-pi install git:github.com/x-thooh/pi-worktree@v0.1.0   # pinned
+pi install git:github.com/x-thooh/pi-worktree@v0.3.0   # pinned
 pi install git:github.com/x-thooh/pi-worktree         # track main
 ```
 
@@ -97,6 +104,7 @@ Config files may be flat or wrapped in `wtWorktree`:
   "worktreePath": "{{ repo_path }}/.worktrees/{{ branch | sanitize }}",
   "hooks": true,
   "mergePrompt": true,
+  "reap": true,
   "createTimeoutMs": 900000
 }
 ```
@@ -106,10 +114,33 @@ Config files may be flat or wrapped in `wtWorktree`:
 | `worktreePath` | `{{ repo_path }}/.worktrees/{{ branch \| sanitize }}` | directory template |
 | `hooks` | `true` | run `<repo>/.config/wt.toml` project hooks during creation |
 | `mergePrompt` | `true` | ask once when the agent settles |
+| `reap` | `true` | reclaim worktrees left behind by dead sessions |
 | `createTimeoutMs` | `900000` | budget for `wt switch`; project hooks can copy gigabytes |
 
 Env overrides: `PI_WT_WORKTREE_PATH`, `PI_WT_WORKTREE_HOOKS` (`0`/`false`),
-`PI_WT_WORKTREE_MERGE_PROMPT`, `PI_WT_WORKTREE_TIMEOUT_MS`.
+`PI_WT_WORKTREE_MERGE_PROMPT`, `PI_WT_WORKTREE_REAP`, `PI_WT_WORKTREE_TIMEOUT_MS`.
+
+## Leftover worktrees
+
+A session can end without a merge — quit, Ctrl-C, crash. The record it leaves in
+`<git-common-dir>/pi-worktree/` carries the owning PID, host, and last-touched
+time, and every startup reaps on four rules:
+
+| Situation | Action |
+| --- | --- |
+| The worktree directory is gone | forget the record, `git worktree prune`; `git branch -d` the branch, which keeps it if it has unmerged commits |
+| The owning session is alive | nothing — never touch a running session |
+| The session is gone and the worktree is empty | `wt remove` it |
+| The session is gone but the worktree has commits or files | keep it, warn with the branch names, never auto-merge |
+
+A PID is only probed on the same host; a record from another machine is assumed
+live. A record untouched for seven days counts as dead even if its PID was
+recycled by an unrelated process. Quitting reclaims an empty worktree
+immediately, which is the common case; anything holding work is left for you.
+
+Nothing in the reap path passes `--force` or `--force-delete`. `wt remove` and
+`git branch -d` both refuse a dirty or unmerged branch on their own, so a probe
+that is wrong still cannot throw work away — it can only fail to clean up.
 
 ## Project hooks (`wt.toml`)
 
@@ -155,7 +186,8 @@ is what the marketing repo's `.gitignore` does.
 - **No nesting.** If Pi starts inside a linked worktree, no second worktree is
   created.
 - **Only on startup.** `reload`, `new`, `resume`, and `fork` re-attach to the
-  persisted worktree.
+  persisted worktree; only a real quit reclaims, so a handover never loses the
+  worktree.
 - **Fail open.** Any extension error is logged and the session continues.
 
 ## Development

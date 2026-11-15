@@ -24,7 +24,7 @@
 //   - Every error path fails open: an extension bug must never block the session.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs"
-import { homedir } from "node:os"
+import { homedir, hostname } from "node:os"
 import { dirname, isAbsolute, join, resolve } from "node:path"
 import type {
   AgentSettledEvent,
@@ -32,6 +32,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  SessionShutdownEvent,
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent"
 
@@ -50,6 +51,12 @@ export interface WorktreeState {
    */
   baseline?: string[]
   createdAt: number
+  /** PID of the session that created the worktree; absent in records written before 0.3.0. */
+  pid?: number
+  /** Host the session ran on. Liveness is only probeable on the same host. */
+  host?: string
+  /** Last time the owning session touched this record, for the stale cutoff. */
+  lastSeen?: number
 }
 
 /** Resolved extension configuration (layered: built-in < user < project < env). */
@@ -60,6 +67,8 @@ interface WtWorktreeConfig {
   hooks: boolean
   /** Ask before running `wt merge` once the agent settles (default true). */
   mergePrompt: boolean
+  /** Remove worktrees whose owning session is gone and that hold no work (default true). */
+  reap: boolean
   /** Budget for worktree creation; project hooks can be slow (default 15 min). */
   createTimeoutMs: number
 }
@@ -136,6 +145,7 @@ function readConfigFile(path: string): Partial<WtWorktreeConfig> | null {
     if (typeof scoped.worktreePath === "string") out.worktreePath = scoped.worktreePath
     if (typeof scoped.hooks === "boolean") out.hooks = scoped.hooks
     if (typeof scoped.mergePrompt === "boolean") out.mergePrompt = scoped.mergePrompt
+    if (typeof scoped.reap === "boolean") out.reap = scoped.reap
     if (typeof scoped.createTimeoutMs === "number") out.createTimeoutMs = scoped.createTimeoutMs
     return out
   } catch {
@@ -374,16 +384,97 @@ function worktreeExists(st: WorktreeState): boolean {
   }
 }
 
-async function readState(pi: ExtensionAPI, cwd: string, sessionId: string): Promise<WorktreeState | null> {
-  const common = await gitCommonDir(pi, cwd)
-  if (!common) return null
+/** How long a record may go untouched before its session counts as gone. */
+export const DEFAULT_STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000
+
+/** Liveness probe for a PID. Signal 0 checks without touching the process. */
+export type PidProbe = (pid: number) => boolean
+
+export const defaultPidProbe: PidProbe = (pid) => {
   try {
-    const st = JSON.parse(readFileSync(stateFile(common, sessionId), "utf8")) as WorktreeState
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    // EPERM: the process exists, it just belongs to another user.
+    return (err as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+/**
+ * Whether the session that owns a record is still running.
+ *
+ * Three answers, in order of trust: a own-host PID is authoritative, a foreign
+ * host cannot be probed at all, and a record without a PID can only come from a
+ * writer older than this version — never from the session asking.
+ */
+export function sessionAlive(
+  st: Pick<WorktreeState, "pid" | "host" | "createdAt" | "lastSeen">,
+  opts: { host?: string; probe?: PidProbe; now?: number; staleAfterMs?: number } = {},
+): boolean {
+  const now = opts.now ?? Date.now()
+  const staleAfter = opts.staleAfterMs ?? DEFAULT_STALE_AFTER_MS
+  // WHY: records written by 0.2.x and earlier carry no pid; every record this
+  // version writes does. A pid-less record therefore belongs to nobody who is
+  // running now, and treating it as dead is what lets the first startup after
+  // the upgrade clear the leftovers that motivated this.
+  if (typeof st.pid !== "number" || !Number.isInteger(st.pid) || st.pid <= 0) return false
+  const seen = st.lastSeen ?? st.createdAt
+  // A live pid that has not touched the record for a week is a reused pid.
+  if (typeof seen === "number" && now - seen > staleAfter) return false
+  // Another machine: cannot probe it, so assume the session is alive.
+  if (st.host && st.host !== (opts.host ?? hostname())) return true
+  return (opts.probe ?? defaultPidProbe)(st.pid)
+}
+
+export type ReapAction = "none" | "drop-record" | "remove-worktree" | "keep"
+
+export interface ReapProbe {
+  exists: boolean
+  alive: boolean
+  work: PendingWork | null
+}
+
+/**
+ * What to do with one persisted record.
+ *
+ * Removing a worktree is only ever allowed when the owning session is gone AND
+ * the worktree holds nothing: commits or uncommitted files are a merge decision
+ * for a human, not garbage. `work: null` means the counts could not be read, so
+ * it is treated as work rather than as nothing.
+ */
+export function reapDecision(p: ReapProbe): ReapAction {
+  if (!p.exists) return "drop-record"
+  if (p.alive) return "none"
+  return hasWork(p.work) || p.work === null ? "keep" : "remove-worktree"
+}
+
+function readStateRecord(path: string): WorktreeState | null {
+  try {
+    const st = JSON.parse(readFileSync(path, "utf8")) as WorktreeState
     if (st && typeof st.path === "string" && typeof st.branch === "string") return st
     return null
   } catch {
     return null
   }
+}
+
+/** Every persisted record in this repo, whether or not its worktree still exists. */
+export function listStates(commonDir: string): Array<{ file: string; st: WorktreeState | null }> {
+  let files: string[]
+  try {
+    files = readdirSync(stateDir(commonDir))
+  } catch {
+    return []
+  }
+  return files
+    .filter((f) => f.endsWith(".json"))
+    .map((file) => ({ file, st: readStateRecord(join(stateDir(commonDir), file)) }))
+}
+
+async function readState(pi: ExtensionAPI, cwd: string, sessionId: string): Promise<WorktreeState | null> {
+  const common = await gitCommonDir(pi, cwd)
+  if (!common) return null
+  return readStateRecord(stateFile(common, sessionId))
 }
 
 async function writeState(pi: ExtensionAPI, cwd: string, sessionId: string, st: WorktreeState): Promise<void> {
@@ -407,23 +498,103 @@ async function removeState(pi: ExtensionAPI, cwd: string, sessionId: string): Pr
   }
 }
 
-/** Other sessions' live worktrees in this repo, for the leftover warning. */
+/** Other *live* sessions' worktrees in this repo, for the leftover warning. */
 async function otherSessionWorktrees(pi: ExtensionAPI, cwd: string, sessionId: string): Promise<string[]> {
   const common = await gitCommonDir(pi, cwd)
   if (!common) return []
-  const dir = stateDir(common)
-  try {
-    const own = `${sanitize(sessionId)}.json`
-    const out: string[] = []
-    for (const file of readdirSync(dir)) {
-      if (!file.endsWith(".json") || file === own) continue
-      const st = safeJson<WorktreeState>(readFileSync(join(dir, file), "utf8"))
-      if (st?.branch && worktreeExists(st)) out.push(st.branch)
+  const own = `${sanitize(sessionId) || "session"}.json`
+  return listStates(common)
+    .filter(({ file, st }) => file !== own && !!st && worktreeExists(st) && sessionAlive(st))
+    .map(({ st }) => (st as WorktreeState).branch)
+}
+
+/**
+ * `wt remove <branch>`, deliberately without `--force` or `--force-delete`: wt
+ * itself refuses a worktree that is dirty or on an unmerged branch, which is the
+ * second safety net behind reapDecision.
+ */
+async function removeWorktree(pi: ExtensionAPI, cwd: string, branch: string) {
+  const root = (await primaryWorktree(pi, cwd)) ?? cwd
+  return pi.exec("wt", ["remove", branch, "-y", "--format", "json"], { cwd: root, timeout: 120_000 })
+}
+
+export interface ReapReport {
+  /** Branches whose worktree was removed. */
+  removed: string[]
+  /** Records deleted because their worktree directory no longer exists. */
+  dropped: number
+  /** Branches left over from dropped records that were not safe to delete. */
+  orphanBranches: string[]
+  /** Abandoned worktrees left alone because they hold work. */
+  kept: string[]
+  /** Abandoned worktrees wt refused to remove; the record stays for the next try. */
+  failed: string[]
+}
+
+/** True when a local branch of that name exists. */
+async function branchExists(pi: ExtensionAPI, cwd: string, branch: string): Promise<boolean> {
+  return (await git(pi, cwd, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`])).code === 0
+}
+
+/**
+ * Reclaim what dead sessions left behind: forget records whose directory is gone,
+ * remove abandoned worktrees that hold nothing, keep the ones that hold work.
+ */
+export async function reapAbandoned(pi: ExtensionAPI, cwd: string, sessionId: string): Promise<ReapReport> {
+  const report: ReapReport = { removed: [], dropped: 0, orphanBranches: [], kept: [], failed: [] }
+  const common = await gitCommonDir(pi, cwd)
+  if (!common) return report
+  const own = `${sanitize(sessionId) || "session"}.json`
+  let pruned = false
+  for (const { file, st } of listStates(common)) {
+    if (file === own) continue
+    const record = join(stateDir(common), file)
+    if (!st || !worktreeExists(st)) {
+      try {
+        unlinkSync(record)
+      } catch {
+        // already gone
+      }
+      report.dropped++
+      pruned = true
+      // The directory is gone, the branch usually is not. `-d` only deletes a
+      // branch whose commits are already reachable; an unmerged one survives and
+      // is reported instead, so a vanished checkout can never lose work.
+      if (st && (await git(pi, cwd, ["branch", "-d", st.branch])).code !== 0 && (await branchExists(pi, cwd, st.branch))) {
+        report.orphanBranches.push(st.branch)
+      }
+      continue
     }
-    return out
-  } catch {
-    return []
+    if (sessionAlive(st)) continue
+    const work = await pendingWork(pi, st)
+    if (reapDecision({ exists: true, alive: false, work }) !== "remove-worktree") {
+      report.kept.push(st.branch)
+      continue
+    }
+    const res = await removeWorktree(pi, cwd, st.branch)
+    if (res.code !== 0) {
+      report.failed.push(st.branch)
+      continue
+    }
+    try {
+      unlinkSync(record)
+    } catch {
+      // already gone
+    }
+    report.removed.push(st.branch)
   }
+  // A vanished directory leaves its admin entry behind in .git/worktrees.
+  if (pruned) await git(pi, cwd, ["worktree", "prune"])
+  return report
+}
+
+/** One-line summary of a reap pass, or null when nothing happened. */
+function describeReap(r: ReapReport): string | null {
+  const parts: string[] = []
+  if (r.dropped > 0) parts.push(`forgot ${r.dropped} record(s) whose worktree is gone`)
+  if (r.removed.length > 0) parts.push(`removed ${r.removed.length} unused worktree(s) (${r.removed.join(", ")})`)
+  if (r.orphanBranches.length > 0) parts.push(`kept unmerged branch(es) ${r.orphanBranches.join(", ")}`)
+  return parts.length > 0 ? parts.join("; ") : null
 }
 
 /** Look up a just-created branch's worktree path via `wt list` (fallback when switch JSON is unreadable). */
@@ -546,6 +717,7 @@ async function loadConfig(pi: ExtensionAPI, cwd: string): Promise<WtWorktreeConf
     worktreePath: null,
     hooks: true,
     mergePrompt: true,
+    reap: true,
     createTimeoutMs: DEFAULT_CREATE_TIMEOUT_MS,
   }
   const projectRoot = await primaryWorktree(pi, cwd)
@@ -558,6 +730,7 @@ async function loadConfig(pi: ExtensionAPI, cwd: string): Promise<WtWorktreeConf
     if (layer.worktreePath !== undefined) cfg.worktreePath = layer.worktreePath
     if (layer.hooks !== undefined) cfg.hooks = layer.hooks
     if (layer.mergePrompt !== undefined) cfg.mergePrompt = layer.mergePrompt
+    if (layer.reap !== undefined) cfg.reap = layer.reap
     if (layer.createTimeoutMs !== undefined) cfg.createTimeoutMs = layer.createTimeoutMs
   }
 
@@ -565,6 +738,8 @@ async function loadConfig(pi: ExtensionAPI, cwd: string): Promise<WtWorktreeConf
   if (envHooks) cfg.hooks = !["0", "false", "no", "off"].includes(envHooks)
   const envPrompt = process.env.PI_WT_WORKTREE_MERGE_PROMPT?.trim().toLowerCase()
   if (envPrompt) cfg.mergePrompt = !["0", "false", "no", "off"].includes(envPrompt)
+  const envReap = process.env.PI_WT_WORKTREE_REAP?.trim().toLowerCase()
+  if (envReap) cfg.reap = !["0", "false", "no", "off"].includes(envReap)
   const envTimeout = Number.parseInt(process.env.PI_WT_WORKTREE_TIMEOUT_MS ?? "", 10)
   if (Number.isFinite(envTimeout) && envTimeout > 0) cfg.createTimeoutMs = envTimeout
 
@@ -609,6 +784,27 @@ async function setup(
     return
   }
 
+  // Reclaim what dead sessions left behind before adding another worktree.
+  if (config.reap) {
+    const reap = await reapAbandoned(pi, cwd, session.sessionId)
+    const done = describeReap(reap)
+    if (done) notify(ctx, `pi-worktree: ${done}`, "info")
+    if (reap.kept.length > 0) {
+      notify(
+        ctx,
+        `pi-worktree: ${reap.kept.length} abandoned worktree(s) still hold work: ${reap.kept.join(", ")} — "wt merge" or "wt remove" them`,
+        "warning",
+      )
+    }
+    if (reap.failed.length > 0) {
+      notify(
+        ctx,
+        `pi-worktree: could not remove ${reap.failed.join(", ")} — uncommitted changes or a process still using it`,
+        "warning",
+      )
+    }
+  }
+
   // Warn about leftover worktrees instead of silently stacking them.
   const prev = await readState(pi, cwd, session.sessionId)
   if (prev && worktreeExists(prev)) {
@@ -616,7 +812,7 @@ async function setup(
   }
   const others = await otherSessionWorktrees(pi, cwd, session.sessionId)
   if (others.length > 0) {
-    notify(ctx, `pi-worktree: ${others.length} other pi worktree(s) in this repo: ${others.join(", ")}`, "info")
+    notify(ctx, `pi-worktree: ${others.length} other live pi worktree(s) in this repo: ${others.join(", ")}`, "info")
   }
 
   const branch = makeBranchName()
@@ -678,6 +874,9 @@ async function setup(
     pathSource: source,
     baseline: await untrackedPaths(pi, createdPath),
     createdAt: Date.now(),
+    pid: process.pid,
+    host: hostname(),
+    lastSeen: Date.now(),
   }
   setState(st)
   await writeState(pi, cwd, session.sessionId, st)
@@ -837,6 +1036,7 @@ export default async function (pi: ExtensionAPI) {
       const known = new Set(state.baseline ?? [])
       for (const file of await untrackedPaths(pi, state.path)) known.add(file)
       state.baseline = [...known]
+      state.lastSeen = Date.now()
       await writeState(pi, ctx.cwd, session.sessionId, state)
     } catch (err) {
       console.error("[pi-worktree] baseline refresh error:", err)
@@ -871,6 +1071,33 @@ export default async function (pi: ExtensionAPI) {
       await askMerge(pi, ctx, session, state, setState, setMerging)
     } catch (err) {
       console.error("[pi-worktree] agent_settled error:", err)
+    }
+  })
+
+  pi.on("session_shutdown", async (event: SessionShutdownEvent, ctx: ExtensionContext) => {
+    // reload/new/resume/fork hand the session to a successor that re-attaches to
+    // the same worktree, so only a real quit may reclaim anything.
+    if (event.reason !== "quit" || !state || merging) return
+    const st = state
+    try {
+      if (!worktreeExists(st)) {
+        await removeState(pi, ctx.cwd, session.sessionId)
+        setState(null)
+        return
+      }
+      const config = await loadConfig(pi, ctx.cwd)
+      const work = await pendingWork(pi, st)
+      if (!config.reap || hasWork(work) || work === null) {
+        // Keep the work and the record: the next startup reports it as abandoned.
+        await writeState(pi, ctx.cwd, session.sessionId, { ...st, lastSeen: Date.now() })
+        return
+      }
+      const res = await removeWorktree(pi, ctx.cwd, st.branch)
+      if (res.code !== 0) return // record stays; the next startup retries
+      await removeState(pi, ctx.cwd, session.sessionId)
+      setState(null)
+    } catch (err) {
+      console.error("[pi-worktree] session_shutdown error:", err)
     }
   })
 

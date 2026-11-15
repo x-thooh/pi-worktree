@@ -8,13 +8,16 @@ import { test } from "node:test"
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import {
   buildSection,
+  defaultPidProbe,
   hasWork,
   isBaseline,
   parseStatus,
   pendingWork,
+  reapDecision,
   refLabel,
   renderTemplate,
   sanitize,
+  sessionAlive,
   shouldOfferMerge,
   statusLine,
   workSignature,
@@ -216,3 +219,48 @@ function worktreeState(path: string): WorktreeState {
     createdAt: 0,
   }
 }
+
+// --- Reclaiming what dead sessions leave behind -------------------------------
+
+test("reapDecision forgets a record whose worktree is already gone", () => {
+  assert.equal(reapDecision({ exists: false, alive: true, work: { commits: 1, files: 1 } }), "drop-record")
+  assert.equal(reapDecision({ exists: false, alive: false, work: null }), "drop-record")
+})
+
+test("reapDecision never touches a live session's worktree", () => {
+  assert.equal(reapDecision({ exists: true, alive: true, work: { commits: 3, files: 2 } }), "none")
+  assert.equal(reapDecision({ exists: true, alive: true, work: { commits: 0, files: 0 } }), "none")
+})
+
+test("reapDecision removes an abandoned worktree only when it holds nothing", () => {
+  assert.equal(reapDecision({ exists: true, alive: false, work: { commits: 0, files: 0 } }), "remove-worktree")
+  // Unreadable counts are treated as work: never delete on a guess.
+  assert.equal(reapDecision({ exists: true, alive: false, work: null }), "keep")
+  assert.equal(reapDecision({ exists: true, alive: false, work: { commits: 1, files: 0 } }), "keep")
+  assert.equal(reapDecision({ exists: true, alive: false, work: { commits: 0, files: 2 } }), "keep")
+})
+
+test("sessionAlive trusts a same-host pid", () => {
+  const st = { pid: 4242, host: "here", createdAt: 1_000, lastSeen: 2_000 }
+  assert.equal(sessionAlive(st, { host: "here", now: 3_000, probe: () => true }), true)
+  assert.equal(sessionAlive(st, { host: "here", now: 3_000, probe: () => false }), false)
+})
+
+test("sessionAlive cannot probe another host and assumes the session lives", () => {
+  const st = { pid: 4242, host: "elsewhere", createdAt: 1_000, lastSeen: 2_000 }
+  assert.equal(sessionAlive(st, { host: "here", now: 3_000, probe: () => false }), true)
+})
+
+test("sessionAlive treats a pid-less record and a stale one as gone", () => {
+  const opts = { host: "here", now: 10_000, probe: () => true }
+  // Written before 0.3.0: no pid, so nobody who is running now owns it.
+  assert.equal(sessionAlive({ createdAt: 1_000 }, opts), false)
+  // Live pid but untouched for longer than the cutoff: the pid was reused.
+  assert.equal(sessionAlive({ pid: 1, host: "here", createdAt: 1_000, lastSeen: 2_000 }, { ...opts, staleAfterMs: 100 }), false)
+  // Same record inside the cutoff: the probe decides.
+  assert.equal(sessionAlive({ pid: 1, host: "here", createdAt: 9_000, lastSeen: 9_900 }, { ...opts, staleAfterMs: 100 }), true)
+})
+
+test("the default pid probe sees this process", () => {
+  assert.equal(defaultPidProbe(process.pid), true)
+})
