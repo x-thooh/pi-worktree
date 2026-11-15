@@ -35,7 +35,7 @@ import type {
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent"
 
-interface WorktreeState {
+export interface WorktreeState {
   branch: string // the created branch, e.g. "pi/20261111-161745-x1y2"
   path: string // absolute worktree directory
   base: string // base ref used at creation, e.g. "origin/main"
@@ -97,7 +97,7 @@ function notify(ctx: ExtensionContext, msg: string, level: "info" | "warning" | 
 }
 
 /** File-system and branch-name safe form of a branch name ("pi/20260101-ab" -> "pi-20260101-ab"). */
-function sanitize(name: string): string {
+export function sanitize(name: string): string {
   return name
     .replace(/[^A-Za-z0-9._-]+/g, "-")
     .replace(/-{2,}/g, "-")
@@ -105,7 +105,7 @@ function sanitize(name: string): string {
 }
 
 /** Render the {{ var }} / {{ var | sanitize }} template syntax used by the path setting. */
-function renderTemplate(tpl: string, vars: Record<string, string>): string {
+export function renderTemplate(tpl: string, vars: Record<string, string>): string {
   return tpl.replace(/\{\{\s*([\w.]+)\s*(?:\|\s*(\w+)\s*)?\}\}/g, (_m, name: string, filter?: string) => {
     const raw = vars[name] ?? vars[name.replace(/\./g, "_")] ?? ""
     return filter === "sanitize" ? sanitize(raw) : raw
@@ -297,7 +297,7 @@ async function resolvePathTemplate(
 }
 
 /** Concrete worktree directory for `branch` from a path template. */
-function worktreePathFor(template: string, projectRoot: string, cwd: string, branch: string): string {
+export function worktreePathFor(template: string, projectRoot: string, cwd: string, branch: string): string {
   const rendered = renderTemplate(template, {
     repo_path: projectRoot,
     primary_worktree_path: projectRoot,
@@ -389,13 +389,13 @@ async function findWorktreePath(pi: ExtensionAPI, cwd: string, branch: string): 
 }
 
 /** Commits and uncommitted files the worktree carries on top of its base. */
-interface PendingWork {
+export interface PendingWork {
   commits: number
   files: number
 }
 
 /** Count what a merge would carry; null when the counts cannot be determined. */
-async function pendingWork(pi: ExtensionAPI, st: WorktreeState): Promise<PendingWork | null> {
+export async function pendingWork(pi: ExtensionAPI, st: WorktreeState): Promise<PendingWork | null> {
   if (!worktreeExists(st)) return null
 
   let commits = 0
@@ -416,7 +416,7 @@ async function pendingWork(pi: ExtensionAPI, st: WorktreeState): Promise<Pending
   return { commits, files }
 }
 
-function hasWork(w: PendingWork | null): boolean {
+export function hasWork(w: PendingWork | null): boolean {
   return !!w && (w.commits > 0 || w.files > 0)
 }
 

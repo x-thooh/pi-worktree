@@ -125,7 +125,7 @@ everything; `/wt-merge` asks again later.
 
 ```bash
 bun install
-bun run typecheck
+bun run typecheck && bun run test
 pi -e .        # load the local package for one session
 ```
 
