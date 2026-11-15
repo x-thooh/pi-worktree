@@ -1,0 +1,50 @@
+{
+  "name": "@xthooh/pi-worktree",
+  "version": "0.1.0",
+  "description": "Pi extension: work in an isolated git worktree created by wt (worktrunk), merge back when the task is done.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "worktree",
+    "worktrunk",
+    "wt",
+    "git"
+  ],
+  "author": "xthooh",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/x-thooh/pi-worktree.git"
+  },
+  "bugs": {
+    "url": "https://github.com/x-thooh/pi-worktree/issues"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  }
+}
