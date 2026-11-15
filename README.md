@@ -23,11 +23,21 @@ The main checkout stays untouched, so a parallel session, an IDE build, or
 ## Install
 
 ```bash
-pi install git:github.com/x-thooh/pi-worktree
+pi install git:github.com/x-thooh/pi-worktree@v0.1.0   # pinned
+pi install git:github.com/x-thooh/pi-worktree         # track main
 ```
 
 Requirements: `wt` (worktrunk) >= 0.81 on `PATH`, and a git repo. Without `wt`
 the extension disables itself with a single warning and never blocks a session.
+
+Pi clones git packages over `https://github.com/…`. If that endpoint is not
+reachable from your network, map GitHub to SSH once — the package then installs
+and updates over SSH with no proxy:
+
+```gitconfig
+[url "git@github.com:"]
+    insteadOf = https://github.com/
+```
 
 ## Commands
 
@@ -128,6 +138,8 @@ bun install
 bun run typecheck && bun run test
 pi -e .        # load the local package for one session
 ```
+
+CI runs the type check and the tests on Node 22.18 and 24 (`.github/workflows/ci.yml`).
 
 ## License
 
